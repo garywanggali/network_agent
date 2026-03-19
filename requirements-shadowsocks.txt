@@ -1,0 +1,1 @@
+shadowsocks-py>=2.9.0

@@ -13,14 +13,30 @@ from io import BytesIO
 
 from flask import Flask, request, Response
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
+MAX_WORKERS = 200
+worker_slots = threading.BoundedSemaphore(MAX_WORKERS)
 
 # 请求时不要验证 SSL（代理场景常用）
 SESSION = requests.Session()
 SESSION.verify = False
 # 转发时直连目标，不使用环境变量里的代理，避免形成代理循环或 502
 SESSION.trust_env = False
+# 避免上游单点抖动导致请求长时间挂起
+retry = Retry(
+    total=2,
+    connect=2,
+    read=1,
+    backoff_factor=0.2,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=False,
+)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
 # 忽略 InsecureRequestWarning
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -49,7 +65,7 @@ def proxy_http():
             headers=headers,
             data=data,
             allow_redirects=False,
-            timeout=30,
+            timeout=(5, 12),
         )
         excluded = ("transfer-encoding", "content-encoding", "content-length", "connection")
         response_headers = [
@@ -128,22 +144,59 @@ def handle_connect_tunnel(client_socket, first_chunk=None):
         else:
             host, port = target, 443
 
-        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        remote.settimeout(30)
+        remote = None
+        connect_err = None
+        # Try all resolved addresses instead of a single connect attempt.
+        # This avoids long stalls when one upstream IP is blackholed.
         try:
-            remote.connect((host, port))
+            addrinfos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except Exception as e:
+            addrinfos = []
+            connect_err = e
+
+        for family, socktype, proto, _, sockaddr in addrinfos:
+            try:
+                candidate = socket.socket(family, socktype, proto)
+                candidate.settimeout(10)
+                candidate.connect(sockaddr)
+                remote = candidate
+                connect_err = None
+                break
+            except Exception as e:
+                connect_err = e
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+
+        if remote is None:
             reply = (
                 b"HTTP/1.1 502 Bad Gateway\r\n"
                 b"Content-Type: text/plain\r\n"
                 b"Connection: close\r\n\r\n"
-                b"Proxy could not connect: " + str(e).encode("utf-8")
+                b"Proxy could not connect: " + str(connect_err).encode("utf-8", errors="replace")
             )
             client_socket.sendall(reply)
             client_socket.close()
             return
 
         client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # Clear short handshake timeout; tunnel should stay open for longer.
+        try:
+            client_socket.settimeout(None)
+        except OSError:
+            pass
+        try:
+            remote.settimeout(None)
+        except OSError:
+            pass
+
+        # Close idle tunnels so threads do not accumulate forever.
+        try:
+            client_socket.settimeout(120)
+            remote.settimeout(120)
+        except OSError:
+            pass
 
         def forward(src, dst):
             try:
@@ -308,6 +361,8 @@ def handle_connection(client_socket, app_wsgi):
             client_socket.close()
         except OSError:
             pass
+    finally:
+        worker_slots.release()
 
 
 def main():
@@ -323,6 +378,22 @@ def main():
 
     while True:
         client_socket, addr = server_socket.accept()
+        # Protect the process from exhausting thread resources.
+        if not worker_slots.acquire(blocking=False):
+            try:
+                client_socket.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Type: text/plain\r\n\r\n"
+                    b"Proxy is busy, please retry."
+                )
+            except OSError:
+                pass
+            try:
+                client_socket.close()
+            except OSError:
+                pass
+            continue
         t = threading.Thread(target=handle_connection, args=(client_socket, app_wsgi))
         t.daemon = True
         t.start()

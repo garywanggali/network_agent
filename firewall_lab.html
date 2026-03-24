@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Linux 防火墙流程控制实验手册</title>
+    <style>
+        :root {
+            --primary-color: #2563eb;
+            --bg-color: #f8fafc;
+            --code-bg: #1e293b;
+            --text-color: #334155;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: var(--bg-color);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        }
+        h1 { border-bottom: 3px solid var(--primary-color); padding-bottom: 10px; color: #1e293b; }
+        h2 { margin-top: 30px; color: var(--primary-color); border-left: 5px solid var(--primary-color); padding-left: 15px; }
+        h3 { color: #475569; }
+        code {
+            background: #e2e8f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: "SFMono-Regular", Consolas, monospace;
+        }
+        pre {
+            background: var(--code-bg);
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 8px;
+            overflow-x: auto;
+            position: relative;
+        }
+        .copy-btn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background: #475569;
+            color: white;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .copy-btn:hover { background: var(--primary-color); }
+        .note {
+            background: #fffbeb;
+            border-left: 4px solid #f59e0b;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { border: 1px solid #e2e8f0; padding: 12px; text-align: left; }
+        th { background: #f1f5f9; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Linux 防火墙流程控制与洪水攻击识别</h1>
+    <p><strong>实验环境：</strong> AWS EC2 (Amazon Linux / Ubuntu) | <strong>工具：</strong> iptables, ab, ping</p>
+
+    <div class="note">
+        <strong>⚠️ 注意：</strong> 实验前请确保 AWS 安全组（Security Group）已放行所有流量，否则系统内部规则无法被外部感知。
+    </div>
+
+    <h2>1. 基础环境安装</h2>
+    <p>首先安装并初始化 iptables 服务：</p>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button>sudo yum install iptables-services -y
+sudo systemctl start iptables
+sudo iptables -F</pre>
+
+    <h2>2. 端口与 ICMP 控制实验</h2>
+    <h3>A. 80 端口开关测试</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 关闭 80 端口访问
+sudo iptables -A INPUT -p tcp --dport 80 -j DROP
+
+# 恢复 80 端口访问
+sudo iptables -D INPUT -p tcp --dport 80 -j DROP</pre>
+
+    <h3>B. Ping (ICMP) 控制</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 禁止外部 Ping 我
+sudo iptables -A INPUT -p icmp --icmp-type echo-request -j DROP</pre>
+
+    <h2>3. 出站流量拦截 (特定 IP)</h2>
+    <p>假设禁止服务器访问目标 IP <code>110.242.68.66</code>：</p>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button>sudo iptables -A OUTPUT -d 110.242.68.66 -j DROP</pre>
+
+    <h2>4. 洪水/异常流量识别与限流（防护配置）</h2>
+    
+    <h3>A. ICMP 异常流量限流与记录</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 1. 限流放行正常包
+sudo iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s --limit-burst 5 -j ACCEPT
+# 2. 记录超限事件（对日志本身也做限速，避免日志被刷爆）
+sudo iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 2/s --limit-burst 20 -j LOG --log-prefix "FLOOD-LOG: "
+# 3. 拦截超限流量
+sudo iptables -A INPUT -p icmp --icmp-type echo-request -j DROP</pre>
+    <p><strong>验证方式（安全）：</strong> 使用少量 <code>ping</code> 验证规则生效，并通过计数器与日志前缀证明限流与拦截链路工作。</p>
+
+    <h3>B. HTTP 并发异常识别与拦截</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 限制单个 IP 并发连接数 > 10 则拦截
+sudo iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 10 -m limit --limit 5/s --limit-burst 50 -j LOG --log-prefix "HTTP-FLOOD: "
+sudo iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 10 -j DROP</pre>
+    <p><strong>验证方式（安全）：</strong> 用浏览器或少量 <code>curl</code> 访问站点，配合计数器与日志前缀作为证据。</p>
+
+    <h2>5. 规则查看与清理</h2>
+    <table>
+        <tr>
+            <th>目标</th>
+            <th>命令</th>
+        </tr>
+        <tr>
+            <td>查看实时计数器</td>
+            <td><code>sudo iptables -nvL --line-numbers</code></td>
+        </tr>
+        <tr>
+            <td>查看攻击/超限日志</td>
+            <td><code>sudo dmesg | grep -E "FLOOD|HTTP-FLOOD"</code></td>
+        </tr>
+        <tr>
+            <td>清空所有规则</td>
+            <td><code>sudo iptables -F</code></td>
+        </tr>
+    </table>
+</div>
+
+<script>
+    function copyCode(btn) {
+        const pre = btn.parentElement;
+        const code = pre.innerText.replace('复制', '').trim();
+        navigator.clipboard.writeText(code);
+        btn.innerText = '已复制';
+        setTimeout(() => btn.innerText = '复制', 2000);
+    }
+</script>
+
+</body>
+</html>

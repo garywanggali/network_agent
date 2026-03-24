@@ -85,6 +85,7 @@ sudo systemctl start iptables
 sudo iptables -F</pre>
 
     <h2>2. 端口与 ICMP 控制实验</h2>
+    <p>每个小实验开始前，建议先执行 <code>sudo iptables -F</code> 清空旧规则，避免规则顺序影响实验现象。</p>
     <h3>A. 80 端口开关测试</h3>
     <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 关闭 80 端口访问
 sudo iptables -A INPUT -p tcp --dport 80 -j DROP
@@ -100,22 +101,26 @@ sudo iptables -A INPUT -p icmp --icmp-type echo-request -j DROP</pre>
     <p>假设禁止服务器访问目标 IP <code>110.242.68.66</code>：</p>
     <pre><button class="copy-btn" onclick="copyCode(this)">复制</button>sudo iptables -A OUTPUT -d 110.242.68.66 -j DROP</pre>
 
-    <h2>4. 洪水/异常流量识别与限流（防护配置）</h2>
+    <h2>4. 洪水攻击识别测试</h2>
     
-    <h3>A. ICMP 异常流量限流与记录</h3>
-    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 1. 限流放行正常包
+    <h3>A. ICMP 洪水识别 (Ping)</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button>sudo iptables -F
+
+# 1. 限流放行正常包
 sudo iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s --limit-burst 5 -j ACCEPT
 # 2. 记录超限事件（对日志本身也做限速，避免日志被刷爆）
 sudo iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 2/s --limit-burst 20 -j LOG --log-prefix "FLOOD-LOG: "
 # 3. 拦截超限流量
 sudo iptables -A INPUT -p icmp --icmp-type echo-request -j DROP</pre>
-    <p><strong>验证方式（安全）：</strong> 使用少量 <code>ping</code> 验证规则生效，并通过计数器与日志前缀证明限流与拦截链路工作。</p>
+    <p><strong>测试命令（仅对你拥有/授权的目标）：</strong> <code>ping -c 30 -i 0.2 [实例IP]</code></p>
 
-    <h3>B. HTTP 并发异常识别与拦截</h3>
-    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button># 限制单个 IP 并发连接数 > 10 则拦截
+    <h3>B. HTTP 并发洪水识别 (ab)</h3>
+    <pre><button class="copy-btn" onclick="copyCode(this)">复制</button>sudo iptables -F
+
+# 限制单个 IP 并发连接数 > 10 则拦截
 sudo iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 10 -m limit --limit 5/s --limit-burst 50 -j LOG --log-prefix "HTTP-FLOOD: "
 sudo iptables -A INPUT -p tcp --syn --dport 80 -m connlimit --connlimit-above 10 -j DROP</pre>
-    <p><strong>验证方式（安全）：</strong> 用浏览器或少量 <code>curl</code> 访问站点，配合计数器与日志前缀作为证据。</p>
+    <p><strong>测试命令（仅对你拥有/授权的目标）：</strong> <code>ab -n 200 -c 20 http://[实例IP]/</code></p>
 
     <h2>5. 规则查看与清理</h2>
     <table>
